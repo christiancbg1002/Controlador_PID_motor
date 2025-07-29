@@ -2,6 +2,7 @@
 #define PIN_PWM    3
 #define PIN_CTRL0  5
 #define PIN_CTRL1  6
+#define PIN_POT    A0   // Potenciómetro conectado a A0
 
 volatile int countPulses = 0;
 
@@ -9,20 +10,29 @@ unsigned long prevMillis = 0;
 unsigned long t0 = 0;
 float elapsed = 0;
 
+// --- Controlador PID (Incremental) ---
+float Kp = 2.1931;
+float Ki = 16.2837;
+float Kd = 0.0237755;
+float dt = 0.05; // 50 ms
+
+float a0 = Kp + Ki * dt + Kd / dt;
+float a1 = -Kp - 2 * Kd / dt;
+float a2 = Kd / dt;
+
+float e[3] = {0, 0, 0};  // e[k], e[k-1], e[k-2]
+int u = 0;               // PWM inicial
 float rpms = 0;
-int   u    = 0;      // PWM inicial: motor detenido
-// ref_rpm ya no se usa para envío, pero lo dejamos por claridad
-float ref_rpm = 0;    
+float ref_rpm = 0;       // Referencia leída desde potenciómetro
 
-bool escalonAplicado = false;
-bool started         = false;  // Espera comando "START" desde MATLAB
+bool started = false;
 
-// --- Conversión de pulsos a RPM (muestreo = 50 ms) -----------------------
+// --- Conversión de pulsos a RPM ---
 float convertP(int pulses) {
-  return (float)pulses / 0.05 / 240.0 * 60.0;  // encoder: 240 pulsos/rev
+  return (float)pulses / dt / 240.0 * 60.0;  // encoder: 240 pulsos/rev
 }
 
-// --- Interrupción para contar pulsos ------------------------------------
+// --- ISR para contar pulsos ---
 void pulses() {
   countPulses++;
 }
@@ -32,19 +42,18 @@ void setup() {
   pinMode(PIN_PWM,    OUTPUT);
   pinMode(PIN_CTRL0,  OUTPUT);
   pinMode(PIN_CTRL1,  OUTPUT);
+  pinMode(PIN_POT,    INPUT);
 
   attachInterrupt(digitalPinToInterrupt(PIN_PULSES), pulses, RISING);
 
   Serial.begin(115200);
 
-  digitalWrite(PIN_CTRL0, HIGH);  // Dirección fija
+  digitalWrite(PIN_CTRL0, HIGH);
   digitalWrite(PIN_CTRL1, LOW);
-
-  analogWrite(PIN_PWM, u);        // Motor detenido
+  analogWrite(PIN_PWM, u);
 }
 
 void loop() {
-  // Esperar comando START
   if (!started) {
     if (Serial.available()) {
       String input = Serial.readStringUntil('\n');
@@ -58,27 +67,39 @@ void loop() {
     return;
   }
 
-  // Tiempo transcurrido en segundos
   unsigned long now = millis();
   elapsed = (now - t0) / 1000.0;
 
-  // Escalón a los 1.0 s
-  if (elapsed >= 1.0 && !escalonAplicado) {
-    ref_rpm = 300;          // solo informativo
-    analogWrite(PIN_PWM, 255);
-    u = 255;
-    escalonAplicado = true;
-  }
-
-  // Muestreo y envío cada 50 ms
   if (now - prevMillis >= 50) {
+    prevMillis = now;
+
+    // Leer potenciómetro y mapear a 0–300 RPM
+    int raw_pot = analogRead(PIN_POT);
+    ref_rpm = map(raw_pot, 0, 1023, 0, 300);
+
+    // Convertir pulsos a RPM
     rpms = convertP(countPulses);
     countPulses = 0;
-    prevMillis  = now;
 
-    // --- ENVIAR SOLO tiempo y RPM ---
+    // PID incremental
+    e[2] = e[1];
+    e[1] = e[0];
+    e[0] = ref_rpm - rpms;
+
+    float du = a0 * e[0] + a1 * e[1] + a2 * e[2];
+    u += (int)du;
+
+    // Saturación del PWM
+    u = constrain(u, 0, 255);
+    analogWrite(PIN_PWM, u);
+
+    // Enviar tiempo, RPM, referencia y error
     Serial.print(elapsed, 3);
     Serial.print(',');
-    Serial.println(rpms, 2);
+    Serial.print(rpms, 2);
+    Serial.print(',');
+    Serial.print(ref_rpm, 2);
+    Serial.print(',');
+    Serial.println(e[0], 2);  // Error actual
   }
 }
